@@ -995,6 +995,7 @@ struct FailingTokenHarness<'a> {
     vault: VaultClient<'a>,
     vault_id: Address,
     token: Address,
+    token_admin: Address,
     test_token: TestTokenClient<'a>,
 }
 
@@ -1006,7 +1007,7 @@ fn setup_failing_token() -> FailingTokenHarness<'static> {
     let token_admin = Address::generate(&env);
     let subscription = Address::generate(&env);
 
-    let token = env.register(TestToken, (token_admin,));
+    let token = env.register(TestToken, (token_admin.clone(),));
     let test_token = TestTokenClient::new(&env, &token);
 
     let vault_id = env.register(Vault, (admin,));
@@ -1018,6 +1019,7 @@ fn setup_failing_token() -> FailingTokenHarness<'static> {
         vault,
         vault_id,
         token,
+        token_admin,
         test_token,
     }
 }
@@ -1114,6 +1116,99 @@ fn failing_transfer_reverts_debit_and_leaves_balances_unchanged() {
     h.test_token.set_fail_transfers(&false);
     h.vault.debit(&user, &h.token, &merchant, &1_200);
 
+    assert_eq!(h.vault.balance(&user, &h.token), 3_800);
+    assert_eq!(h.test_token.balance(&merchant), 1_200);
+    assert_eq!(h.test_token.balance(&h.vault_id), 3_800);
+}
+
+#[test]
+fn fee_on_transfer_deposit_is_rejected_and_moves_nothing() {
+    let h = setup_failing_token();
+    let user = Address::generate(&h.env);
+    h.test_token.mint(&user, &10_000);
+    h.test_token.set_transfer_fee_bps(&100);
+
+    // The vault would receive 9_900 but credit 10_000: reject before writing.
+    assert_eq!(
+        h.vault.try_deposit(&user, &h.token, &10_000),
+        Err(Ok(Error::UnexpectedTransferAmount))
+    );
+
+    assert_eq!(h.vault.balance(&user, &h.token), 0);
+    assert_eq!(h.test_token.balance(&user), 10_000);
+    assert_eq!(h.test_token.balance(&h.vault_id), 0);
+    assert_eq!(h.test_token.balance(&h.token_admin), 0);
+
+    // Without the fee the same deposit is exact and succeeds.
+    h.test_token.set_transfer_fee_bps(&0);
+    h.vault.deposit(&user, &h.token, &10_000);
+    assert_eq!(h.vault.balance(&user, &h.token), 10_000);
+    assert_eq!(h.test_token.balance(&user), 0);
+    assert_eq!(h.test_token.balance(&h.vault_id), 10_000);
+}
+
+#[test]
+fn fee_on_transfer_deposit_without_user_auth_moves_nothing() {
+    let h = setup_failing_token();
+    let user = Address::generate(&h.env);
+    h.test_token.mint(&user, &10_000);
+    h.test_token.set_transfer_fee_bps(&100);
+
+    h.env.mock_auths(&[]);
+    assert!(h.vault.try_deposit(&user, &h.token, &4_000).is_err());
+
+    assert_eq!(h.vault.balance(&user, &h.token), 0);
+    assert_eq!(h.test_token.balance(&user), 10_000);
+    assert_eq!(h.test_token.balance(&h.vault_id), 0);
+}
+
+#[test]
+fn fee_on_transfer_withdraw_is_rejected_and_state_unchanged() {
+    let h = setup_failing_token();
+    let user = Address::generate(&h.env);
+    h.test_token.mint(&user, &10_000);
+    h.vault.deposit(&user, &h.token, &4_000);
+
+    h.test_token.set_transfer_fee_bps(&100);
+    assert_eq!(
+        h.vault.try_withdraw(&user, &h.token, &1_500),
+        Err(Ok(Error::UnexpectedTransferAmount))
+    );
+
+    // The user would receive 1_485 while the vault burned 1_500 of their
+    // balance: the whole withdrawal is rolled back.
+    assert_eq!(h.vault.balance(&user, &h.token), 4_000);
+    assert_eq!(h.test_token.balance(&user), 6_000);
+    assert_eq!(h.test_token.balance(&h.vault_id), 4_000);
+
+    h.test_token.set_transfer_fee_bps(&0);
+    h.vault.withdraw(&user, &h.token, &1_500);
+    assert_eq!(h.vault.balance(&user, &h.token), 2_500);
+    assert_eq!(h.test_token.balance(&user), 7_500);
+    assert_eq!(h.test_token.balance(&h.vault_id), 2_500);
+}
+
+#[test]
+fn fee_on_transfer_debit_is_rejected_and_state_unchanged() {
+    let h = setup_failing_token();
+    let user = Address::generate(&h.env);
+    let merchant = Address::generate(&h.env);
+    h.test_token.mint(&user, &10_000);
+    h.vault.deposit(&user, &h.token, &5_000);
+
+    h.test_token.set_transfer_fee_bps(&100);
+    assert_eq!(
+        h.vault.try_debit(&user, &h.token, &merchant, &1_200),
+        Err(Ok(Error::UnexpectedTransferAmount))
+    );
+
+    // The merchant would receive 1_188 for a 1_200 charge: reject and roll back.
+    assert_eq!(h.vault.balance(&user, &h.token), 5_000);
+    assert_eq!(h.test_token.balance(&merchant), 0);
+    assert_eq!(h.test_token.balance(&h.vault_id), 5_000);
+
+    h.test_token.set_transfer_fee_bps(&0);
+    h.vault.debit(&user, &h.token, &merchant, &1_200);
     assert_eq!(h.vault.balance(&user, &h.token), 3_800);
     assert_eq!(h.test_token.balance(&merchant), 1_200);
     assert_eq!(h.test_token.balance(&h.vault_id), 3_800);
@@ -2838,6 +2933,89 @@ fn deposit_for_signed_by_the_subscriber_instead_of_the_payer_is_rejected() {
         .is_err());
     assert_eq!(h.vault.balance(&subscriber, &h.token), 0);
     assert_eq!(h.token_client.balance(&stranger), 10_000);
+}
+
+// ---------------------------------------------------------------------------
+// Numeric maximum values (#242)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn deposit_and_withdraw_i128_max_round_trip() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    h.token_admin.mint(&user, &i128::MAX);
+    h.vault.set_deposit_cap(&user, &h.token, &i128::MAX);
+
+    h.vault.deposit(&user, &h.token, &i128::MAX);
+    assert_eq!(h.vault.balance(&user, &h.token), i128::MAX);
+    assert_eq!(h.vault.deposit_cap(&user, &h.token), i128::MAX);
+    assert_eq!(h.token_client.balance(&user), 0);
+    assert_eq!(h.token_client.balance(&h.vault_id), i128::MAX);
+
+    assert_eq!(h.vault.withdraw_all(&user, &h.token), i128::MAX);
+    assert_eq!(h.vault.balance(&user, &h.token), 0);
+    assert_eq!(h.token_client.balance(&user), i128::MAX);
+    assert_eq!(h.token_client.balance(&h.vault_id), 0);
+}
+
+#[test]
+fn reserve_and_spend_limit_at_i128_max_do_not_wrap() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    let recipient = Address::generate(&h.env);
+    h.token_admin.mint(&user, &i128::MAX);
+    h.vault.deposit(&user, &h.token, &i128::MAX);
+
+    h.vault.set_reserve(&user, &h.token, &1, &i128::MAX);
+    assert_eq!(h.vault.reserved(&user, &h.token, &1), i128::MAX);
+    assert_eq!(h.vault.reserved_total(&user, &h.token), i128::MAX);
+    assert_eq!(h.vault.unreserved_balance(&user, &h.token), 0);
+    assert_eq!(
+        h.vault.try_withdraw(&user, &h.token, &1),
+        Err(Ok(Error::InsufficientBalance))
+    );
+    assert_eq!(h.vault.withdraw_all(&user, &h.token), 0);
+    h.vault.set_reserve(&user, &h.token, &1, &0);
+
+    h.vault
+        .set_spend_limit(&user, &h.token, &i128::MAX, &u64::MAX);
+    let limit = h.vault.spend_limit(&user, &h.token);
+    assert_eq!(limit.amount, i128::MAX);
+    assert_eq!(limit.window_secs, u64::MAX);
+
+    // Put the current window at its largest representable spent total while
+    // the balance still has room, which a replenished account can reach.
+    h.env.as_contract(&h.vault_id, || {
+        h.env.storage().persistent().set(
+            &DataKey::SpendWindow(user.clone(), h.token.clone()),
+            &SpendWindow {
+                start: h.env.ledger().timestamp(),
+                spent: i128::MAX,
+            },
+        );
+    });
+
+    // spent == i128::MAX would make `spent + amount` overflow. It must be a
+    // typed SpendLimitExceeded error and leave the balance untouched.
+    assert_eq!(
+        h.vault.try_debit(&user, &h.token, &recipient, &1),
+        Err(Ok(Error::SpendLimitExceeded))
+    );
+    assert_eq!(h.vault.balance(&user, &h.token), i128::MAX);
+    assert_eq!(h.token_client.balance(&recipient), 0);
+}
+
+#[test]
+fn maximum_deposit_requires_the_users_auth() {
+    let h = setup();
+    let user = Address::generate(&h.env);
+    h.token_admin.mint(&user, &i128::MAX);
+    h.env.set_auths(&[]);
+
+    assert!(h.vault.try_deposit(&user, &h.token, &i128::MAX).is_err());
+    assert_eq!(h.vault.balance(&user, &h.token), 0);
+    assert_eq!(h.token_client.balance(&user), i128::MAX);
+    assert_eq!(h.token_client.balance(&h.vault_id), 0);
 }
 
 // ---------------------------------------------------------------------------

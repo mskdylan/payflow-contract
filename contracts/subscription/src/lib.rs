@@ -1448,11 +1448,16 @@ mod contract {
                 return Err(Error::RefundExceedsReceived);
             }
 
-            token::TokenClient::new(&env, &mandate.token).transfer(
-                &merchant,
-                &mandate.subscriber,
-                &amount,
-            );
+            let token_client = token::TokenClient::new(&env, &mandate.token);
+            let received_before = token_client.balance(&mandate.subscriber);
+            token_client.transfer(&merchant, &mandate.subscriber, &amount);
+            let received = token_client
+                .balance(&mandate.subscriber)
+                .checked_sub(received_before)
+                .ok_or(Error::UnexpectedTransferAmount)?;
+            if received != amount {
+                return Err(Error::UnexpectedTransferAmount);
+            }
 
             mandate.refunded += amount;
             Self::write_mandate(&env, &mandate);
@@ -2553,13 +2558,19 @@ mod contract {
                 {
                     continue;
                 }
-                // Normalize to the plan's period
-                let contribution = mandate
-                    .amount
-                    .checked_mul(i128::from(plan.period))
-                    .ok_or(Error::AmountOverflow)
-                    .unwrap_or(0)
-                    / i128::from(mandate.period);
+                // Normalize to the plan's period. Equal periods need no
+                // multiplication: doing it anyway overflows for an amount near
+                // i128::MAX and silently reports zero committed revenue.
+                let contribution = if mandate.period == plan.period {
+                    mandate.amount
+                } else {
+                    mandate
+                        .amount
+                        .checked_mul(i128::from(plan.period))
+                        .ok_or(Error::AmountOverflow)
+                        .unwrap_or(0)
+                        / i128::from(mandate.period)
+                };
                 total = total.checked_add(contribution).unwrap_or(total);
             }
 
